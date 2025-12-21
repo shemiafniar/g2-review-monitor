@@ -1,16 +1,11 @@
 import json
 import os
 import requests
-import smtplib
 import time
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 
 # Configuration from environment variables
-EMAIL_RECIPIENTS = os.environ.get('EMAIL_RECIPIENTS')
-SENDER_EMAIL = os.environ.get('SENDER_EMAIL')
-EMAIL_PASSWORD = os.environ.get('EMAIL_PASSWORD')
+SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL')
 BRIGHT_DATA_API_KEY = os.environ.get('BRIGHT_DATA_API_KEY')
 BRIGHT_DATA_ENDPOINT = os.environ.get('BRIGHT_DATA_ENDPOINT')
 STATE_FILE = 'last_review.json'
@@ -127,115 +122,47 @@ def scrape_g2_reviews():
         traceback.print_exc()
         return None
 
-def send_email_notification(review):
-    """Send email notification about new review"""
+def send_slack_notification(review):
+    """Send notification to Slack via Workflow Webhook"""
     try:
-        stars_emoji = "⭐" * int(float(review['stars']))
+        if not SLACK_WEBHOOK_URL:
+            print("❌ SLACK_WEBHOOK_URL not configured")
+            return False
+        
+        # Prepare review text
         first_text = review['text'][0] if review.get('text') and len(review['text']) > 0 else "No review text available"
         
         # Clean up text
         if "Answer:" in first_text:
             first_text = first_text.split("Answer:")[1].strip()
         
-        subject = f"🎉 New G2 Review for Bright Data - {review['stars']}/5 {stars_emoji}"
+        # Truncate if too long
+        if len(first_text) > 500:
+            first_text = first_text[:500] + "..."
         
-        html_body = f"""
-        <html>
-        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
-            <div style="max-width: 600px; margin: 0 auto; padding: 20px; border: 2px solid #4CAF50; border-radius: 10px;">
-                <h2 style="color: #4CAF50; text-align: center;">🎉 New G2 Review for Bright Data!</h2>
-                
-                <div style="background-color: #f5f5f5; padding: 15px; border-radius: 5px; margin: 20px 0;">
-                    <table style="width: 100%;">
-                        <tr>
-                            <td style="padding: 5px;"><strong>👤 Author:</strong></td>
-                            <td style="padding: 5px;">{review['author']}</td>
-                        </tr>
-                        <tr>
-                            <td style="padding: 5px;"><strong>⭐ Rating:</strong></td>
-                            <td style="padding: 5px;">{stars_emoji} {review['stars']}/5</td>
-                        </tr>
-                        <tr>
-                            <td style="padding: 5px;"><strong>📅 Date:</strong></td>
-                            <td style="padding: 5px;">{review['date']}</td>
-                        </tr>
-                        <tr>
-                            <td style="padding: 5px;"><strong>💼 Position:</strong></td>
-                            <td style="padding: 5px;">{review.get('position', 'N/A')}</td>
-                        </tr>
-                        <tr>
-                            <td style="padding: 5px;"><strong>🏢 Company Size:</strong></td>
-                            <td style="padding: 5px;">{review.get('company_size', 'N/A')}</td>
-                        </tr>
-                    </table>
-                </div>
-                
-                <div style="margin: 20px 0;">
-                    <h3 style="color: #333;">{review['title']}</h3>
-                    <p style="background-color: #fff; padding: 15px; border-left: 4px solid #4CAF50;">
-                        {first_text[:500]}...
-                    </p>
-                </div>
-                
-                <div style="text-align: center; margin: 20px 0;">
-                    <a href="{review['review_url']}" 
-                       style="background-color: #4CAF50; color: white; padding: 12px 30px; 
-                              text-decoration: none; border-radius: 5px; display: inline-block;">
-                        View Full Review 👀
-                    </a>
-                </div>
-                
-                <div style="text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd; color: #999; font-size: 12px;">
-                    Automated by G2 Review Monitor
-                </div>
-            </div>
-        </body>
-        </html>
-        """
+        stars_emoji = "⭐" * int(float(review['stars']))
         
-        text_body = f"""
-New G2 Review for Bright Data!
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-👤 Author: {review['author']}
-⭐ Rating: {stars_emoji} {review['stars']}/5
-📅 Date: {review['date']}
-💼 Position: {review.get('position', 'N/A')}
-🏢 Company Size: {review.get('company_size', 'N/A')}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📝 {review['title']}
-
-{first_text[:500]}...
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-🔗 View full review: {review['review_url']}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Automated by G2 Review Monitor
-        """
+        # Prepare payload for Slack workflow
+        payload = {
+            "review_title": review['title'],
+            "review_author": review['author'],
+            "review_rating": f"{review['stars']}/5 {stars_emoji}",
+            "review_date": review['date'],
+            "review_url": review['review_url'],
+            "review_text": first_text
+        }
         
-        msg = MIMEMultipart('alternative')
-        msg['From'] = SENDER_EMAIL
-        msg['To'] = EMAIL_RECIPIENTS
-        msg['Subject'] = subject
+        print(f"📤 Sending to Slack webhook...")
+        print(f"   Review: {review['title']}")
         
-        msg.attach(MIMEText(text_body, 'plain', 'utf-8'))
-        msg.attach(MIMEText(html_body, 'html', 'utf-8'))
+        response = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
+        response.raise_for_status()
         
-        # Send via Gmail SMTP
-        with smtplib.SMTP('smtp.gmail.com', 587) as server:
-            server.starttls()
-            server.login(SENDER_EMAIL, EMAIL_PASSWORD)
-            server.send_message(msg)
-        
-        print("✅ Email notification sent successfully")
+        print("✅ Notification sent to Slack successfully")
         return True
+        
     except Exception as e:
-        print(f"❌ Error sending email: {e}")
+        print(f"❌ Error sending to Slack: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -266,11 +193,11 @@ def main():
     if latest_review_id != last_stored_id:
         print(f"\n🆕 NEW REVIEW DETECTED!")
         
-        if send_email_notification(latest_review):
+        if send_slack_notification(latest_review):
             save_last_review_id(latest_review_id)
             print("✅ State updated successfully")
         else:
-            print("⚠️ Email failed - state not updated")
+            print("⚠️ Slack notification failed - state not updated")
     else:
         print("\n✨ No new reviews - all caught up!")
     
