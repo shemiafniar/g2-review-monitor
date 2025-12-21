@@ -28,7 +28,14 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           BRIGHT_DATA_API_KEY: ${{ secrets.BRIGHT_DATA_API_KEY }}
           BRIGHT_DATA_ENDPOINT: ${{ secrets.BRIGHT_DATA_ENDPOINT }}
-        run: python check_reviews.py
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "List files:"
+          ls -la
+          echo "Running check_reviews.py:"
+          python check_reviews.py
+
       
       - name: Commit updated state
         run: |
