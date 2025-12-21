@@ -35,7 +35,6 @@ jobs:
           ls -la
           echo "Running check_reviews.py:"
           python check_reviews.py
-
       
       - name: Commit updated state
         run: |
