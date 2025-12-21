@@ -3,7 +3,7 @@ name: Check G2 Reviews Daily
 on:
   schedule:
     # Runs every day at 9 AM UTC
-    - cron: '0 9 * * *'
+    - cron: '0 */6 * * *'
   workflow_dispatch: # Allows manual testing
 
 jobs:
