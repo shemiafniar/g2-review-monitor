@@ -70,7 +70,7 @@ def should_run_check():
                 now = datetime.utcnow()
                 hours_since = (now - last_time).total_seconds() / 3600
                 
-                if hours_since < 0.5:  # Less than 30 minutes since last check
+                if hours_since < 0.5:
                     print(f"⏭️ Skipping - last checked {hours_since:.1f} hours ago (too recent)")
                     return False
     except:
@@ -85,7 +85,7 @@ def is_review_recent(review, days=30):
         cutoff_date = datetime.utcnow() - timedelta(days=days)
         return review_date >= cutoff_date
     except:
-        return True  # If can't parse date, assume it's valid
+        return True
 
 def trigger_collection_with_retry(headers, payload, max_retries=3):
     """Trigger Bright Data collection with retry logic"""
@@ -102,7 +102,7 @@ def trigger_collection_with_retry(headers, payload, max_retries=3):
         except requests.exceptions.Timeout:
             print(f"⏱️ Timeout on attempt {attempt}")
             if attempt < max_retries:
-                wait_time = attempt * 10  # 10s, 20s, 30s
+                wait_time = attempt * 10
                 print(f"   Retrying in {wait_time} seconds...")
                 time.sleep(wait_time)
             else:
@@ -142,7 +142,6 @@ def check_progress_with_retry(snapshot_id, headers, max_wait=180, check_interval
             progress_response.raise_for_status()
             progress_data = progress_response.json()
             
-            # Reset failure counter on success
             consecutive_failures = 0
             
             status = progress_data.get('status', 'unknown')
@@ -166,7 +165,6 @@ def check_progress_with_retry(snapshot_id, headers, max_wait=180, check_interval
                 print(f"❌ Too many consecutive failures checking progress")
                 return False
             
-            # Don't count this against total time
             continue
     
     print("❌ Timeout waiting for data")
@@ -193,7 +191,7 @@ def download_data_with_retry(snapshot_id, headers, max_retries=3):
         except requests.exceptions.Timeout:
             print(f"⏱️ Download timeout on attempt {attempt}")
             if attempt < max_retries:
-                wait_time = attempt * 15  # 15s, 30s, 45s
+                wait_time = attempt * 15
                 print(f"   Retrying in {wait_time} seconds...")
                 time.sleep(wait_time)
             else:
@@ -232,13 +230,11 @@ def scrape_g2_reviews():
     ]
     
     try:
-        # STEP 1: Trigger collection with retry
         trigger_result = trigger_collection_with_retry(headers, payload, max_retries=3)
         
         if not trigger_result:
             return None
         
-        # Get snapshot_id
         if isinstance(trigger_result, list) and len(trigger_result) > 0:
             snapshot_id = trigger_result[0].get('snapshot_id')
         else:
@@ -250,11 +246,9 @@ def scrape_g2_reviews():
         
         print(f"📸 Snapshot ID: {snapshot_id}")
         
-        # STEP 2: Check progress with retry
         if not check_progress_with_retry(snapshot_id, headers, max_wait=180, check_interval=10):
             return None
         
-        # STEP 3: Download data with retry
         data = download_data_with_retry(snapshot_id, headers, max_retries=3)
         return data
         
@@ -272,7 +266,11 @@ def send_slack_notification(review, max_retries=3):
                 print("❌ SLACK_WEBHOOK_URL not configured")
                 return False
             
-            first_text = review['text'][0] if review.get('text') and len(review['text']) > 0 else "No review text available"
+            first_text = review.get('text', ['No review text available'])
+            if isinstance(first_text, list) and len(first_text) > 0:
+                first_text = first_text[0]
+            elif not isinstance(first_text, str):
+                first_text = "No review text available"
             
             if "Answer:" in first_text:
                 first_text = first_text.split("Answer:")[1].strip()
@@ -280,18 +278,23 @@ def send_slack_notification(review, max_retries=3):
             if len(first_text) > 500:
                 first_text = first_text[:500] + "..."
             
-            stars_emoji = "⭐" * int(float(review['stars']))
+            stars = review.get('stars', 0)
+            try:
+                stars_count = int(float(stars))
+                stars_emoji = "⭐" * stars_count
+            except:
+                stars_emoji = "⭐"
             
             payload = {
-                "review_title": review['title'],
-                "review_author": review['author'],
-                "review_rating": f"{review['stars']}/5 {stars_emoji}",
-                "review_date": review['date'],
-                "review_url": review['review_url'],
+                "review_title": review.get('title', 'No title'),
+                "review_author": review.get('author', 'Unknown'),
+                "review_rating": f"{stars}/5 {stars_emoji}",
+                "review_date": review.get('date', 'Unknown date'),
+                "review_url": review.get('review_url', 'https://www.g2.com/products/bright-data/reviews'),
                 "review_text": first_text
             }
             
-            print(f"📤 Sending to Slack: {review['title']} (Attempt {attempt}/{max_retries})")
+            print(f"📤 Sending to Slack: {review.get('title', 'Unknown')} (Attempt {attempt}/{max_retries})")
             
             response = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
             response.raise_for_status()
@@ -367,18 +370,15 @@ def main():
     print(f"⏰ Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
     print("=" * 60)
     
-    # Validate secrets
     if not validate_secrets():
         print("\n❌ Cannot proceed without required secrets")
         return
     
-    # Check if we should run (avoid duplicates)
     if not should_run_check():
         print("\n✅ Check skipped to avoid duplicate runs")
         return
     
     try:
-        # Scrape reviews with retry logic
         reviews_data = scrape_g2_reviews()
         
         if not reviews_data or len(reviews_data) == 0:
@@ -387,57 +387,98 @@ def main():
             send_error_notification(error_msg)
             return
         
+        if not isinstance(reviews_data, list):
+            error_msg = f"Invalid data format received from Bright Data API. Expected list, got {type(reviews_data).__name__}"
+            print(f"\n❌ {error_msg}")
+            send_error_notification(error_msg)
+            return
+        
         last_stored_id = load_last_review_id()
         print(f"\n💾 Last stored review ID: {last_stored_id}")
         print(f"📊 Total reviews fetched: {len(reviews_data)}")
         
-        # Find all new reviews
         new_reviews = []
-        for review in reviews_data:
-            if review['review_id'] > last_stored_id and is_review_recent(review):
-                new_reviews.append(review)
+        for i, review in enumerate(reviews_data):
+            try:
+                if not isinstance(review, dict):
+                    print(f"⚠️ Skipping invalid review at index {i} (not a dict): {type(review).__name__}")
+                    continue
+                
+                if 'review_id' not in review:
+                    print(f"⚠️ Skipping review at index {i} (missing review_id)")
+                    continue
+                
+                if 'date' not in review:
+                    print(f"⚠️ Skipping review at index {i} (missing date)")
+                    continue
+                
+                review_id = review['review_id']
+                if not isinstance(review_id, (int, float)):
+                    print(f"⚠️ Skipping review with invalid ID type: {type(review_id).__name__}")
+                    continue
+                
+                if review_id > last_stored_id and is_review_recent(review):
+                    new_reviews.append(review)
+                    
+            except Exception as e:
+                print(f"⚠️ Error processing review at index {i}: {e}")
+                continue
         
         if len(new_reviews) == 0:
             print("\n✨ No new reviews - all caught up!")
             
-            # Send weekly health check if needed
             send_health_check()
             
-            # Update last checked time
             if reviews_data:
-                latest_review_id = max(review['review_id'] for review in reviews_data)
-                save_last_review_id(latest_review_id)
+                try:
+                    valid_ids = [r['review_id'] for r in reviews_data if isinstance(r, dict) and 'review_id' in r]
+                    if valid_ids:
+                        latest_review_id = max(valid_ids)
+                        save_last_review_id(latest_review_id)
+                except Exception as e:
+                    print(f"⚠️ Could not update last review ID: {e}")
             
             print("\n" + "=" * 60)
             print("✅ Check complete")
             print("=" * 60)
             return
         
-        # Sort new reviews by ID (oldest first)
         new_reviews.sort(key=lambda x: x['review_id'])
         
         print(f"\n🆕 FOUND {len(new_reviews)} NEW REVIEW(S)!")
         print("=" * 60)
         
-        # Send notification for each new review
         successful_notifications = 0
         failed_reviews = []
         
         for i, review in enumerate(new_reviews, 1):
-            print(f"\n[{i}/{len(new_reviews)}] Processing Review ID: {review['review_id']}")
-            print(f"  📝 Title: {review['title']}")
-            print(f"  👤 Author: {review['author']}")
-            print(f"  ⭐ Rating: {review['stars']}/5")
-            print(f"  📅 Date: {review['date']}")
-            
-            if send_slack_notification(review):
-                successful_notifications += 1
-                # Small delay between notifications
-                if i < len(new_reviews):
-                    time.sleep(2)
-            else:
-                failed_reviews.append(review['review_id'])
-                print(f"  ❌ Failed to send notification")
+            try:
+                print(f"\n[{i}/{len(new_reviews)}] Processing Review ID: {review.get('review_id', 'unknown')}")
+                print(f"  📝 Title: {review.get('title', 'N/A')}")
+                print(f"  👤 Author: {review.get('author', 'N/A')}")
+                print(f"  ⭐ Rating: {review.get('stars', 'N/A')}/5")
+                print(f"  📅 Date: {review.get('date', 'N/A')}")
+                
+                required_fields = ['review_id', 'title', 'author', 'stars', 'date', 'review_url']
+                missing_fields = [field for field in required_fields if field not in review]
+                
+                if missing_fields:
+                    print(f"  ⚠️ Review missing required fields: {missing_fields}")
+                    failed_reviews.append(review.get('review_id', 'unknown'))
+                    continue
+                
+                if send_slack_notification(review):
+                    successful_notifications += 1
+                    if i < len(new_reviews):
+                        time.sleep(2)
+                else:
+                    failed_reviews.append(review['review_id'])
+                    print(f"  ❌ Failed to send notification")
+                    
+            except Exception as e:
+                print(f"  ❌ Error processing review: {e}")
+                failed_reviews.append(review.get('review_id', 'unknown'))
+                continue
         
         print(f"\n{'=' * 60}")
         print(f"✅ Successfully sent {successful_notifications}/{len(new_reviews)} notifications")
@@ -447,10 +488,14 @@ def main():
             error_msg = f"Failed to send {len(failed_reviews)} notification(s) for review IDs: {failed_reviews}"
             send_error_notification(error_msg)
         
-        # Update stored ID to the most recent review
-        latest_review_id = max(review['review_id'] for review in reviews_data)
-        save_last_review_id(latest_review_id)
-        print(f"💾 State updated - Latest review ID: {latest_review_id}")
+        try:
+            valid_ids = [r['review_id'] for r in reviews_data if isinstance(r, dict) and 'review_id' in r]
+            if valid_ids:
+                latest_review_id = max(valid_ids)
+                save_last_review_id(latest_review_id)
+                print(f"💾 State updated - Latest review ID: {latest_review_id}")
+        except Exception as e:
+            print(f"⚠️ Could not update state: {e}")
         
         print("\n" + "=" * 60)
         print("✅ Check complete")
