@@ -87,8 +87,137 @@ def is_review_recent(review, days=30):
     except:
         return True  # If can't parse date, assume it's valid
 
+def trigger_collection_with_retry(headers, payload, max_retries=3):
+    """Trigger Bright Data collection with retry logic"""
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"🌐 Triggering collection (Attempt {attempt}/{max_retries})...")
+            response = requests.post(BRIGHT_DATA_ENDPOINT, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            trigger_result = response.json()
+            
+            print(f"✅ Collection triggered successfully")
+            return trigger_result
+            
+        except requests.exceptions.Timeout:
+            print(f"⏱️ Timeout on attempt {attempt}")
+            if attempt < max_retries:
+                wait_time = attempt * 10  # 10s, 20s, 30s
+                print(f"   Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                print(f"❌ Failed after {max_retries} timeout attempts")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️ Network error on attempt {attempt}: {e}")
+            if attempt < max_retries:
+                wait_time = attempt * 10
+                print(f"   Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                print(f"❌ Failed after {max_retries} attempts")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Unexpected error: {e}")
+            return None
+    
+    return None
+
+def check_progress_with_retry(snapshot_id, headers, max_wait=180, check_interval=10):
+    """Check collection progress with retry logic"""
+    elapsed = 0
+    progress_url = f"https://api.brightdata.com/datasets/v3/progress/{snapshot_id}"
+    consecutive_failures = 0
+    max_consecutive_failures = 3
+    
+    while elapsed < max_wait:
+        print(f"⏳ Checking progress... ({elapsed}s)")
+        time.sleep(check_interval)
+        elapsed += check_interval
+        
+        try:
+            progress_response = requests.get(progress_url, headers=headers, timeout=30)
+            progress_response.raise_for_status()
+            progress_data = progress_response.json()
+            
+            # Reset failure counter on success
+            consecutive_failures = 0
+            
+            status = progress_data.get('status', 'unknown')
+            print(f"   Status: {status}")
+            
+            if status == 'ready':
+                print(f"✅ Data is ready!")
+                return True
+            elif status == 'running':
+                print(f"   Still gathering data...")
+                continue
+            elif status == 'failed':
+                print(f"❌ Collection failed: {progress_data}")
+                return False
+                
+        except requests.exceptions.RequestException as e:
+            consecutive_failures += 1
+            print(f"⚠️ Error checking progress (failure {consecutive_failures}/{max_consecutive_failures}): {e}")
+            
+            if consecutive_failures >= max_consecutive_failures:
+                print(f"❌ Too many consecutive failures checking progress")
+                return False
+            
+            # Don't count this against total time
+            continue
+    
+    print("❌ Timeout waiting for data")
+    return False
+
+def download_data_with_retry(snapshot_id, headers, max_retries=3):
+    """Download data with retry logic"""
+    download_url = f"https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}?format=json"
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"📥 Downloading data (Attempt {attempt}/{max_retries})...")
+            download_response = requests.get(download_url, headers=headers, timeout=60)
+            download_response.raise_for_status()
+            data = download_response.json()
+            
+            if data and len(data) > 0:
+                print(f"✅ Successfully received {len(data)} reviews")
+                return data
+            else:
+                print("⚠️ No reviews in response")
+                return None
+                
+        except requests.exceptions.Timeout:
+            print(f"⏱️ Download timeout on attempt {attempt}")
+            if attempt < max_retries:
+                wait_time = attempt * 15  # 15s, 30s, 45s
+                print(f"   Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                print(f"❌ Failed to download after {max_retries} attempts")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️ Download error on attempt {attempt}: {e}")
+            if attempt < max_retries:
+                wait_time = attempt * 15
+                print(f"   Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                print(f"❌ Failed to download after {max_retries} attempts")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Unexpected download error: {e}")
+            return None
+    
+    return None
+
 def scrape_g2_reviews():
-    """Scrape G2 reviews using Bright Data Datasets API"""
+    """Scrape G2 reviews using Bright Data Datasets API with comprehensive retry logic"""
     headers = {
         'Authorization': f'Bearer {BRIGHT_DATA_API_KEY}',
         'Content-Type': 'application/json'
@@ -103,13 +232,13 @@ def scrape_g2_reviews():
     ]
     
     try:
-        print(f"🌐 Step 1: Triggering Bright Data collection...")
-        response = requests.post(BRIGHT_DATA_ENDPOINT, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-        trigger_result = response.json()
+        # STEP 1: Trigger collection with retry
+        trigger_result = trigger_collection_with_retry(headers, payload, max_retries=3)
         
-        print(f"✅ Collection triggered successfully")
+        if not trigger_result:
+            return None
         
+        # Get snapshot_id
         if isinstance(trigger_result, list) and len(trigger_result) > 0:
             snapshot_id = trigger_result[0].get('snapshot_id')
         else:
@@ -121,62 +250,14 @@ def scrape_g2_reviews():
         
         print(f"📸 Snapshot ID: {snapshot_id}")
         
-        max_wait = 180
-        wait_interval = 10
-        elapsed = 0
-        
-        progress_url = f"https://api.brightdata.com/datasets/v3/progress/{snapshot_id}"
-        
-        while elapsed < max_wait:
-            print(f"⏳ Step 2: Checking progress... ({elapsed}s)")
-            time.sleep(wait_interval)
-            elapsed += wait_interval
-            
-            try:
-                progress_response = requests.get(progress_url, headers=headers, timeout=30)
-                progress_response.raise_for_status()
-                progress_data = progress_response.json()
-                
-                status = progress_data.get('status', 'unknown')
-                print(f"   Status: {status}")
-                
-                if status == 'ready':
-                    print(f"✅ Data is ready!")
-                    break
-                elif status == 'running':
-                    print(f"   Still gathering data...")
-                    continue
-                elif status == 'failed':
-                    print(f"❌ Collection failed: {progress_data}")
-                    return None
-                    
-            except Exception as e:
-                print(f"⚠️ Error checking progress: {e}")
-                if elapsed >= max_wait - wait_interval:
-                    return None
-                continue
-        
-        if elapsed >= max_wait:
-            print("❌ Timeout waiting for data")
+        # STEP 2: Check progress with retry
+        if not check_progress_with_retry(snapshot_id, headers, max_wait=180, check_interval=10):
             return None
         
-        print(f"📥 Step 3: Downloading data...")
-        download_url = f"https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}?format=json"
+        # STEP 3: Download data with retry
+        data = download_data_with_retry(snapshot_id, headers, max_retries=3)
+        return data
         
-        download_response = requests.get(download_url, headers=headers, timeout=30)
-        download_response.raise_for_status()
-        data = download_response.json()
-        
-        if data and len(data) > 0:
-            print(f"✅ Successfully received {len(data)} reviews")
-            return data
-        else:
-            print("⚠️ No reviews in response")
-            return None
-        
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Network error in scraping process: {e}")
-        return None
     except Exception as e:
         print(f"❌ Unexpected error in scraping process: {e}")
         import traceback
@@ -247,7 +328,7 @@ def send_error_notification(error_message):
             "review_rating": "⚠️ Error",
             "review_date": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
             "review_url": "https://github.com/shemiafniar/g2-review-monitor/actions",
-            "review_text": f"The G2 review monitoring script encountered an error:\n\n{error_message}\n\nPlease check the GitHub Actions logs for details."
+            "review_text": f"The G2 review monitoring script encountered an error:\n\n{error_message}\n\nThis may be a temporary issue. The system will retry on the next scheduled run."
         }
         
         response = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
@@ -271,7 +352,7 @@ def send_health_check():
                     "review_rating": "✅ System Active",
                     "review_date": datetime.utcnow().strftime("%Y-%m-%d"),
                     "review_url": "https://www.g2.com/products/bright-data/reviews",
-                    "review_text": f"No new reviews detected in the past {int(days_since)} days.\n\nThe monitoring system is running normally and checking every 6 hours.\n\nLast notification sent: {last_notif_time.strftime('%Y-%m-%d %H:%M UTC')}"
+                    "review_text": f"No new reviews detected in the past {int(days_since)} days.\n\nThe monitoring system is running normally and checking twice daily.\n\nLast notification sent: {last_notif_time.strftime('%Y-%m-%d %H:%M UTC')}"
                 }
                 
                 response = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
@@ -297,11 +378,11 @@ def main():
         return
     
     try:
-        # Scrape reviews
+        # Scrape reviews with retry logic
         reviews_data = scrape_g2_reviews()
         
         if not reviews_data or len(reviews_data) == 0:
-            error_msg = "Failed to retrieve data from Bright Data API. The API may be down or rate-limited."
+            error_msg = "Failed to retrieve data from Bright Data API after multiple retry attempts. This may be temporary - the system will retry on the next scheduled run."
             print(f"\n⚠️ {error_msg}")
             send_error_notification(error_msg)
             return
