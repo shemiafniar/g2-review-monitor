@@ -78,13 +78,20 @@ def should_run_check():
     
     return True
 
-def is_review_recent(review, days=30):
-    """Check if review is from the last X days"""
+def is_review_recent(review, days=60):
+    """Check if review is from the last X days (or slightly in the future for clock skew)"""
     try:
         review_date = datetime.strptime(review['date'], '%Y-%m-%d')
         cutoff_date = datetime.utcnow() - timedelta(days=days)
-        return review_date >= cutoff_date
-    except:
+        future_cutoff = datetime.utcnow() + timedelta(days=30)
+        
+        if cutoff_date <= review_date <= future_cutoff:
+            return True
+        else:
+            print(f"   ⚠️ Review date {review['date']} is outside valid range ({cutoff_date.date()} to {future_cutoff.date()})")
+            return False
+    except Exception as e:
+        print(f"   ⚠️ Could not parse date: {e}")
         return True
 
 def trigger_collection_with_retry(headers, payload, max_retries=3):
@@ -125,15 +132,15 @@ def trigger_collection_with_retry(headers, payload, max_retries=3):
     
     return None
 
-def check_progress_with_retry(snapshot_id, headers, max_wait=180, check_interval=10):
-    """Check collection progress with retry logic"""
+def check_progress_with_retry(snapshot_id, headers, max_wait=1500, check_interval=15):
+    """Check collection progress with retry logic - allows up to 25 minutes"""
     elapsed = 0
     progress_url = f"https://api.brightdata.com/datasets/v3/progress/{snapshot_id}"
     consecutive_failures = 0
     max_consecutive_failures = 3
     
     while elapsed < max_wait:
-        print(f"⏳ Checking progress... ({elapsed}s)")
+        print(f"⏳ Checking progress... ({elapsed}s / {max_wait}s max)")
         time.sleep(check_interval)
         elapsed += check_interval
         
@@ -148,9 +155,9 @@ def check_progress_with_retry(snapshot_id, headers, max_wait=180, check_interval
             print(f"   Status: {status}")
             
             if status == 'ready':
-                print(f"✅ Data is ready!")
+                print(f"✅ Data is ready! (took {elapsed}s)")
                 return True
-            elif status == 'running':
+            elif status == 'running' or status == 'starting':
                 print(f"   Still gathering data...")
                 continue
             elif status == 'failed':
@@ -167,7 +174,7 @@ def check_progress_with_retry(snapshot_id, headers, max_wait=180, check_interval
             
             continue
     
-    print("❌ Timeout waiting for data")
+    print(f"❌ Timeout waiting for data (waited {max_wait}s / {max_wait/60:.1f} minutes)")
     return False
 
 def download_data_with_retry(snapshot_id, headers, max_retries=3):
@@ -246,7 +253,7 @@ def scrape_g2_reviews():
         
         print(f"📸 Snapshot ID: {snapshot_id}")
         
-        if not check_progress_with_retry(snapshot_id, headers, max_wait=180, check_interval=10):
+        if not check_progress_with_retry(snapshot_id, headers, max_wait=1500, check_interval=15):
             return None
         
         data = download_data_with_retry(snapshot_id, headers, max_retries=3)
@@ -417,8 +424,13 @@ def main():
                     print(f"⚠️ Skipping review with invalid ID type: {type(review_id).__name__}")
                     continue
                 
+                print(f"🔍 Checking review {review_id} (date: {review.get('date')})...")
+                
                 if review_id > last_stored_id and is_review_recent(review):
+                    print(f"   ✅ New review detected: {review_id}")
                     new_reviews.append(review)
+                elif review_id <= last_stored_id:
+                    print(f"   ⏭️ Already processed (ID {review_id} <= {last_stored_id})")
                     
             except Exception as e:
                 print(f"⚠️ Error processing review at index {i}: {e}")
