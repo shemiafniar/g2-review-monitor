@@ -30,19 +30,23 @@ def validate_secrets():
     return True
 
 def load_last_review_id():
-    """Load the last review ID from file"""
+    """Load the last review ID and list of seen IDs from file"""
     try:
         with open(STATE_FILE, 'r') as f:
             data = json.load(f)
-            return data.get('last_review_id', 0)
+            return data.get('last_review_id', 0), data.get('seen_review_ids', [])
     except FileNotFoundError:
-        return 0
+        return 0, []
 
-def save_last_review_id(review_id):
-    """Save the last review ID to file"""
+def save_last_review_id(review_id, seen_ids):
+    """Save the last review ID and seen IDs to file"""
+    # Keep only the last 100 seen IDs to prevent file from growing too large
+    seen_ids = list(set(seen_ids))[-100:]
+    
     with open(STATE_FILE, 'w') as f:
         json.dump({
             'last_review_id': review_id,
+            'seen_review_ids': seen_ids,
             'last_checked': datetime.utcnow().isoformat(),
             'last_notification_sent': datetime.utcnow().isoformat()
         }, f, indent=2)
@@ -83,7 +87,7 @@ def is_review_recent(review, days=60):
     try:
         review_date = datetime.strptime(review['date'], '%Y-%m-%d')
         cutoff_date = datetime.utcnow() - timedelta(days=days)
-        future_cutoff = datetime.utcnow() + timedelta(days=30)
+        future_cutoff = datetime.utcnow() + timedelta(days=365)  # Allow up to 1 year in future (for date typos)
         
         if cutoff_date <= review_date <= future_cutoff:
             return True
@@ -400,8 +404,11 @@ def main():
             send_error_notification(error_msg)
             return
         
-        last_stored_id = load_last_review_id()
+        last_stored_id, seen_ids = load_last_review_id()
         print(f"\n💾 Last stored review ID: {last_stored_id}")
+        print(f"📋 Seen review IDs count: {len(seen_ids)}")
+        if len(seen_ids) > 0:
+            print(f"📝 Last 5 seen IDs: {sorted(seen_ids)[-5:]}")
         print(f"📊 Total reviews fetched: {len(reviews_data)}")
         
         new_reviews = []
@@ -424,13 +431,21 @@ def main():
                     print(f"⚠️ Skipping review with invalid ID type: {type(review_id).__name__}")
                     continue
                 
-                print(f"🔍 Checking review {review_id} (date: {review.get('date')})...")
+                author_name = review.get('author', 'unknown')[:30]
+                print(f"🔍 Checking review {review_id} (date: {review.get('date')}, author: {author_name})...")
                 
-                if review_id > last_stored_id and is_review_recent(review):
-                    print(f"   ✅ New review detected: {review_id}")
-                    new_reviews.append(review)
-                elif review_id <= last_stored_id:
-                    print(f"   ⏭️ Already processed (ID {review_id} <= {last_stored_id})")
+                # Check if we've seen this review before
+                if review_id in seen_ids:
+                    print(f"   ⏭️ Already processed (ID {review_id} in seen list)")
+                    continue
+                
+                # Check if review is recent
+                if not is_review_recent(review):
+                    print(f"   ⏭️ Review too old, skipping")
+                    continue
+                
+                print(f"   ✅ New review detected: {review_id}")
+                new_reviews.append(review)
                     
             except Exception as e:
                 print(f"⚠️ Error processing review at index {i}: {e}")
@@ -446,7 +461,10 @@ def main():
                     valid_ids = [r['review_id'] for r in reviews_data if isinstance(r, dict) and 'review_id' in r]
                     if valid_ids:
                         latest_review_id = max(valid_ids)
-                        save_last_review_id(latest_review_id)
+                        # Add all current review IDs to seen list
+                        seen_ids.extend(valid_ids)
+                        save_last_review_id(latest_review_id, seen_ids)
+                        print(f"💾 State updated - Latest review ID: {latest_review_id}, Total seen: {len(set(seen_ids))}")
                 except Exception as e:
                     print(f"⚠️ Could not update last review ID: {e}")
             
@@ -455,13 +473,15 @@ def main():
             print("=" * 60)
             return
         
-        new_reviews.sort(key=lambda x: x['review_id'])
+        # Sort new reviews by date first, then by ID (oldest first)
+        new_reviews.sort(key=lambda x: (x.get('date', ''), x['review_id']))
         
         print(f"\n🆕 FOUND {len(new_reviews)} NEW REVIEW(S)!")
         print("=" * 60)
         
         successful_notifications = 0
         failed_reviews = []
+        newly_seen_ids = []
         
         for i, review in enumerate(new_reviews, 1):
             try:
@@ -481,6 +501,7 @@ def main():
                 
                 if send_slack_notification(review):
                     successful_notifications += 1
+                    newly_seen_ids.append(review['review_id'])
                     if i < len(new_reviews):
                         time.sleep(2)
                 else:
@@ -504,8 +525,11 @@ def main():
             valid_ids = [r['review_id'] for r in reviews_data if isinstance(r, dict) and 'review_id' in r]
             if valid_ids:
                 latest_review_id = max(valid_ids)
-                save_last_review_id(latest_review_id)
-                print(f"💾 State updated - Latest review ID: {latest_review_id}")
+                # Add all newly processed IDs and current IDs to seen list
+                seen_ids.extend(newly_seen_ids)
+                seen_ids.extend(valid_ids)
+                save_last_review_id(latest_review_id, seen_ids)
+                print(f"💾 State updated - Latest review ID: {latest_review_id}, Total seen: {len(set(seen_ids))}")
         except Exception as e:
             print(f"⚠️ Could not update state: {e}")
         
