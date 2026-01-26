@@ -2,8 +2,9 @@ name: Check G2 Reviews Daily
 
 on:
   schedule:
+    # Runs twice per day: 9 AM and 9 PM UTC
     - cron: '0 9,21 * * *'
-  workflow_dispatch:
+  workflow_dispatch: # Allows manual testing
 
 jobs:
   check-reviews:
@@ -40,10 +41,8 @@ jobs:
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           
-          # Add the file first
           git add last_review.json
           
-          # Check if there are changes to commit
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
