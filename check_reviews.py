@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 # Configuration from environment variables
 SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL')
+SLACK_ERROR_WEBHOOK_URL = os.environ.get('SLACK_ERROR_WEBHOOK_URL')  # NEW!
 BRIGHT_DATA_API_KEY = os.environ.get('BRIGHT_DATA_API_KEY')
 BRIGHT_DATA_ENDPOINT = os.environ.get('BRIGHT_DATA_ENDPOINT')
 STATE_FILE = 'last_review.json'
@@ -26,6 +27,10 @@ def validate_secrets():
         print(f"❌ {error_msg}")
         return False
     
+    # Error webhook is optional
+    if not SLACK_ERROR_WEBHOOK_URL:
+        print("⚠️ SLACK_ERROR_WEBHOOK_URL not configured - errors will be logged only")
+    
     print("✅ All secrets validated")
     return True
 
@@ -40,7 +45,6 @@ def load_last_review_id():
 
 def save_last_review_id(review_id, seen_ids):
     """Save the last review ID and seen IDs to file"""
-    # Keep only the last 100 seen IDs to prevent file from growing too large
     seen_ids = list(set(seen_ids))[-100:]
     
     with open(STATE_FILE, 'w') as f:
@@ -87,7 +91,7 @@ def is_review_recent(review, days=60):
     try:
         review_date = datetime.strptime(review['date'], '%Y-%m-%d')
         cutoff_date = datetime.utcnow() - timedelta(days=days)
-        future_cutoff = datetime.utcnow() + timedelta(days=365)  # Allow up to 1 year in future (for date typos)
+        future_cutoff = datetime.utcnow() + timedelta(days=365)
         
         if cutoff_date <= review_date <= future_cutoff:
             return True
@@ -330,25 +334,31 @@ def send_slack_notification(review, max_retries=3):
     
     return False
 
-def send_error_notification(error_message):
-    """Send error notification to Slack"""
+def send_error_notification(error_message, error_type="Error"):
+    """Send error notification to separate Slack channel/webhook"""
     try:
-        if not SLACK_WEBHOOK_URL:
+        # Use error webhook if available, otherwise use main webhook
+        webhook_url = SLACK_ERROR_WEBHOOK_URL if SLACK_ERROR_WEBHOOK_URL else SLACK_WEBHOOK_URL
+        
+        if not webhook_url:
+            print("⚠️ No webhook URL available for error notification")
             return False
         
         payload = {
-            "review_title": "⚠️ G2 Review Monitor - Error Alert",
+            "review_title": f"⚠️ G2 Review Monitor - {error_type}",
             "review_author": "Automation System",
-            "review_rating": "⚠️ Error",
+            "review_rating": "⚠️ " + error_type,
             "review_date": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
             "review_url": "https://github.com/shemiafniar/g2-review-monitor/actions",
-            "review_text": f"The G2 review monitoring script encountered an error:\n\n{error_message}\n\nThis may be a temporary issue. The system will retry on the next scheduled run."
+            "review_text": f"{error_message}\n\n⚙️ The system will automatically retry on the next scheduled run (every 6 hours).\n\n📋 Check GitHub Actions logs for details."
         }
         
-        response = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
+        response = requests.post(webhook_url, json=payload, timeout=10)
         response.raise_for_status()
+        print(f"✅ Error notification sent to {'error channel' if SLACK_ERROR_WEBHOOK_URL else 'main channel'}")
         return True
-    except:
+    except Exception as e:
+        print(f"⚠️ Failed to send error notification: {e}")
         return False
 
 def send_health_check():
@@ -393,15 +403,17 @@ def main():
         reviews_data = scrape_g2_reviews()
         
         if not reviews_data or len(reviews_data) == 0:
-            error_msg = "Failed to retrieve data from Bright Data API after multiple retry attempts. This may be temporary - the system will retry on the next scheduled run."
+            error_msg = "Failed to retrieve data from Bright Data API after multiple retry attempts.\n\n🔄 Possible causes:\n- Bright Data API is temporarily unavailable\n- Network connectivity issues\n- Rate limiting\n\nThe system will NOT update the state file, so all pending reviews will be checked again on the next run."
             print(f"\n⚠️ {error_msg}")
-            send_error_notification(error_msg)
+            send_error_notification(error_msg, "Bright Data API Failure")
+            # DON'T update state - let next run retry!
             return
         
         if not isinstance(reviews_data, list):
             error_msg = f"Invalid data format received from Bright Data API. Expected list, got {type(reviews_data).__name__}"
             print(f"\n❌ {error_msg}")
-            send_error_notification(error_msg)
+            send_error_notification(error_msg, "Data Format Error")
+            # DON'T update state - let next run retry!
             return
         
         last_stored_id, seen_ids = load_last_review_id()
@@ -434,12 +446,10 @@ def main():
                 author_name = review.get('author', 'unknown')[:30]
                 print(f"🔍 Checking review {review_id} (date: {review.get('date')}, author: {author_name})...")
                 
-                # Check if we've seen this review before
                 if review_id in seen_ids:
                     print(f"   ⏭️ Already processed (ID {review_id} in seen list)")
                     continue
                 
-                # Check if review is recent
                 if not is_review_recent(review):
                     print(f"   ⏭️ Review too old, skipping")
                     continue
@@ -461,7 +471,6 @@ def main():
                     valid_ids = [r['review_id'] for r in reviews_data if isinstance(r, dict) and 'review_id' in r]
                     if valid_ids:
                         latest_review_id = max(valid_ids)
-                        # Add all current review IDs to seen list
                         seen_ids.extend(valid_ids)
                         save_last_review_id(latest_review_id, seen_ids)
                         print(f"💾 State updated - Latest review ID: {latest_review_id}, Total seen: {len(set(seen_ids))}")
@@ -473,7 +482,6 @@ def main():
             print("=" * 60)
             return
         
-        # Sort new reviews by date first, then by ID (oldest first)
         new_reviews.sort(key=lambda x: (x.get('date', ''), x['review_id']))
         
         print(f"\n🆕 FOUND {len(new_reviews)} NEW REVIEW(S)!")
@@ -518,29 +526,33 @@ def main():
         
         if failed_reviews:
             print(f"⚠️ Failed review IDs: {failed_reviews}")
-            error_msg = f"Failed to send {len(failed_reviews)} notification(s) for review IDs: {failed_reviews}"
-            send_error_notification(error_msg)
-        
-        try:
-            valid_ids = [r['review_id'] for r in reviews_data if isinstance(r, dict) and 'review_id' in r]
-            if valid_ids:
-                latest_review_id = max(valid_ids)
-                # Add all newly processed IDs and current IDs to seen list
-                seen_ids.extend(newly_seen_ids)
-                seen_ids.extend(valid_ids)
-                save_last_review_id(latest_review_id, seen_ids)
-                print(f"💾 State updated - Latest review ID: {latest_review_id}, Total seen: {len(set(seen_ids))}")
-        except Exception as e:
-            print(f"⚠️ Could not update state: {e}")
+            error_msg = f"Failed to send {len(failed_reviews)} notification(s) to Slack.\n\nFailed review IDs: {failed_reviews}\n\n⚙️ These reviews will be retried on the next run since state was not updated."
+            send_error_notification(error_msg, "Slack Notification Failure")
+            # DON'T update state for failed reviews - let next run retry!
+            print("\n⚠️ State NOT updated due to failures - will retry on next run")
+        else:
+            # Only update state if ALL notifications succeeded
+            try:
+                valid_ids = [r['review_id'] for r in reviews_data if isinstance(r, dict) and 'review_id' in r]
+                if valid_ids:
+                    latest_review_id = max(valid_ids)
+                    seen_ids.extend(newly_seen_ids)
+                    seen_ids.extend(valid_ids)
+                    save_last_review_id(latest_review_id, seen_ids)
+                    print(f"💾 State updated - Latest review ID: {latest_review_id}, Total seen: {len(set(seen_ids))}")
+            except Exception as e:
+                print(f"⚠️ Could not update state: {e}")
+                error_msg = f"Successfully sent all notifications but failed to update state file.\n\nError: {str(e)}\n\n⚠️ This may cause duplicate notifications on next run."
+                send_error_notification(error_msg, "State Update Failure")
         
         print("\n" + "=" * 60)
         print("✅ Check complete")
         print("=" * 60)
         
     except Exception as e:
-        error_msg = f"Unexpected error in main execution: {str(e)}"
+        error_msg = f"Unexpected error in main execution:\n\n{str(e)}\n\nThe system will retry on the next scheduled run."
         print(f"\n❌ {error_msg}")
-        send_error_notification(error_msg)
+        send_error_notification(error_msg, "System Error")
         import traceback
         traceback.print_exc()
         print("\n" + "=" * 60)
