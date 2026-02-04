@@ -31,8 +31,10 @@ jobs:
       - name: Check for new G2 reviews
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_ERROR_WEBHOOK_URL: ${{ secrets.SLACK_ERROR_WEBHOOK_URL }}  # ← This line!
           BRIGHT_DATA_API_KEY: ${{ secrets.BRIGHT_DATA_API_KEY }}
           BRIGHT_DATA_ENDPOINT: ${{ secrets.BRIGHT_DATA_ENDPOINT }}
+
         run: |
           python check_reviews.py
       
