@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 
 # Configuration from environment variables
 SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL')
-SLACK_ERROR_WEBHOOK_URL = os.environ.get('SLACK_ERROR_WEBHOOK_URL')  # NEW!
+SLACK_ERROR_WEBHOOK_URL = os.environ.get('SLACK_ERROR_WEBHOOK_URL')
 BRIGHT_DATA_API_KEY = os.environ.get('BRIGHT_DATA_API_KEY')
 BRIGHT_DATA_ENDPOINT = os.environ.get('BRIGHT_DATA_ENDPOINT')
 STATE_FILE = 'last_review.json'
@@ -27,9 +27,8 @@ def validate_secrets():
         print(f"❌ {error_msg}")
         return False
     
-    # Error webhook is optional
     if not SLACK_ERROR_WEBHOOK_URL:
-        print("⚠️ SLACK_ERROR_WEBHOOK_URL not configured - errors will be logged only")
+        print("⚠️ SLACK_ERROR_WEBHOOK_URL not configured - errors will go to main channel")
     
     print("✅ All secrets validated")
     return True
@@ -200,7 +199,7 @@ def download_data_with_retry(snapshot_id, headers, max_retries=3):
                 print(f"✅ Successfully received {len(data)} reviews")
                 return data
             else:
-                print("⚠️ No reviews in response")
+                print("⚠️ Bright Data returned 0 records (Status: Ready but no data)")
                 return None
                 
         except requests.exceptions.Timeout:
@@ -248,6 +247,7 @@ def scrape_g2_reviews():
         trigger_result = trigger_collection_with_retry(headers, payload, max_retries=3)
         
         if not trigger_result:
+            print("❌ Failed to trigger collection")
             return None
         
         if isinstance(trigger_result, list) and len(trigger_result) > 0:
@@ -262,9 +262,15 @@ def scrape_g2_reviews():
         print(f"📸 Snapshot ID: {snapshot_id}")
         
         if not check_progress_with_retry(snapshot_id, headers, max_wait=1500, check_interval=15):
+            print("❌ Collection progress check failed")
             return None
         
         data = download_data_with_retry(snapshot_id, headers, max_retries=3)
+        
+        if not data or len(data) == 0:
+            print("⚠️ Bright Data returned 0 records (common temporary issue)")
+            return None
+        
         return data
         
     except Exception as e:
@@ -272,6 +278,54 @@ def scrape_g2_reviews():
         import traceback
         traceback.print_exc()
         return None
+
+def scrape_g2_reviews_with_retry(max_workflow_retries=2, retry_delay=180):
+    """
+    Retry the entire scraping workflow if Bright Data returns no data
+    max_workflow_retries: How many times to retry the ENTIRE workflow (default: 2)
+    retry_delay: Seconds to wait between workflow retries (default: 180 = 3 minutes)
+    """
+    for workflow_attempt in range(1, max_workflow_retries + 1):
+        print(f"\n{'='*60}")
+        print(f"🔄 WORKFLOW ATTEMPT {workflow_attempt}/{max_workflow_retries}")
+        print(f"{'='*60}")
+        
+        data = scrape_g2_reviews()
+        
+        if data and len(data) > 0:
+            print(f"\n✅ Successfully retrieved {len(data)} reviews on workflow attempt {workflow_attempt}")
+            return data
+        
+        # No data received
+        if workflow_attempt < max_workflow_retries:
+            print(f"\n⚠️ No data received from Bright Data (workflow attempt {workflow_attempt}/{max_workflow_retries})")
+            print(f"⏳ Waiting {retry_delay} seconds ({retry_delay//60} minutes) before retrying entire workflow...")
+            print(f"   📝 Note: Bright Data often returns 0 records temporarily when:")
+            print(f"       - G2 website is rate-limiting scrapers")
+            print(f"       - Bright Data's scraper pool is refreshing")
+            print(f"       - G2 made minor page structure changes")
+            
+            # Countdown timer with progress updates
+            remaining = retry_delay
+            while remaining > 0:
+                if remaining == retry_delay:
+                    print(f"\n   ⏱️ Countdown: {remaining}s ({remaining//60}min {remaining%60}s)")
+                elif remaining % 60 == 0:
+                    print(f"   ⏱️ {remaining}s remaining ({remaining//60} minute{'' if remaining//60 == 1 else 's'})...")
+                elif remaining == 30:
+                    print(f"   ⏱️ {remaining}s remaining...")
+                elif remaining == 10:
+                    print(f"   ⏱️ {remaining}s remaining...")
+                
+                time.sleep(min(10, remaining))
+                remaining -= min(10, remaining)
+            
+            print(f"\n   🔄 Retry delay complete. Starting workflow attempt {workflow_attempt + 1}...")
+        else:
+            print(f"\n❌ Failed to retrieve data after {max_workflow_retries} complete workflow attempts")
+            print(f"   Each attempt included: trigger → wait → download → retry on failures")
+    
+    return None
 
 def send_slack_notification(review, max_retries=3):
     """Send notification to Slack with retry logic"""
@@ -337,7 +391,6 @@ def send_slack_notification(review, max_retries=3):
 def send_error_notification(error_message, error_type="Error"):
     """Send error notification to separate Slack channel/webhook"""
     try:
-        # Use error webhook if available, otherwise use main webhook
         webhook_url = SLACK_ERROR_WEBHOOK_URL if SLACK_ERROR_WEBHOOK_URL else SLACK_WEBHOOK_URL
         
         if not webhook_url:
@@ -350,12 +403,14 @@ def send_error_notification(error_message, error_type="Error"):
             "review_rating": "⚠️ " + error_type,
             "review_date": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
             "review_url": "https://github.com/shemiafniar/g2-review-monitor/actions",
-            "review_text": f"{error_message}\n\n⚙️ The system will automatically retry on the next scheduled run (every 6 hours).\n\n📋 Check GitHub Actions logs for details."
+            "review_text": f"{error_message}\n\n⚙️ The system will automatically retry on the next scheduled run.\n\n📋 Check GitHub Actions logs for details."
         }
         
         response = requests.post(webhook_url, json=payload, timeout=10)
         response.raise_for_status()
-        print(f"✅ Error notification sent to {'error channel' if SLACK_ERROR_WEBHOOK_URL else 'main channel'}")
+        
+        channel_name = "error channel" if SLACK_ERROR_WEBHOOK_URL else "main channel"
+        print(f"✅ Error notification sent to {channel_name}")
         return True
     except Exception as e:
         print(f"⚠️ Failed to send error notification: {e}")
@@ -400,20 +455,39 @@ def main():
         return
     
     try:
-        reviews_data = scrape_g2_reviews()
+        # Use retry wrapper - retries entire workflow if needed
+        reviews_data = scrape_g2_reviews_with_retry(
+            max_workflow_retries=2,  # Retry entire workflow up to 2 times
+            retry_delay=180  # Wait 3 minutes between workflow retries
+        )
         
         if not reviews_data or len(reviews_data) == 0:
-            error_msg = "Failed to retrieve data from Bright Data API after multiple retry attempts.\n\n🔄 Possible causes:\n- Bright Data API is temporarily unavailable\n- Network connectivity issues\n- Rate limiting\n\nThe system will NOT update the state file, so all pending reviews will be checked again on the next run."
+            error_msg = (
+                "Failed to retrieve data from Bright Data API after multiple complete workflow retries.\n\n"
+                "🔄 Retry attempts made:\n"
+                "  • 2 complete workflow cycles (trigger → wait → download)\n"
+                "  • 3-minute delays between workflow attempts\n"
+                "  • Multiple network retry attempts within each workflow\n\n"
+                "⚠️ Bright Data Status: 'Ready' but returned 0 records\n\n"
+                "📊 Common causes:\n"
+                "  • G2 website temporarily blocking scrapers\n"
+                "  • Bright Data scraper pool refreshing\n"
+                "  • G2 page structure changed\n"
+                "  • Rate limiting by G2\n\n"
+                "✅ Next steps:\n"
+                "  • State file NOT updated (no data loss)\n"
+                "  • System will retry automatically in 6 hours\n"
+                "  • All pending reviews will be checked on next run\n\n"
+                "💡 If this persists, check Bright Data dashboard manually."
+            )
             print(f"\n⚠️ {error_msg}")
-            send_error_notification(error_msg, "Bright Data API Failure")
-            # DON'T update state - let next run retry!
+            send_error_notification(error_msg, "Bright Data - No Data After Full Retry")
             return
         
         if not isinstance(reviews_data, list):
             error_msg = f"Invalid data format received from Bright Data API. Expected list, got {type(reviews_data).__name__}"
             print(f"\n❌ {error_msg}")
             send_error_notification(error_msg, "Data Format Error")
-            # DON'T update state - let next run retry!
             return
         
         last_stored_id, seen_ids = load_last_review_id()
@@ -526,12 +600,10 @@ def main():
         
         if failed_reviews:
             print(f"⚠️ Failed review IDs: {failed_reviews}")
-            error_msg = f"Failed to send {len(failed_reviews)} notification(s) to Slack.\n\nFailed review IDs: {failed_reviews}\n\n⚙️ These reviews will be retried on the next run since state was not updated."
+            error_msg = f"Failed to send {len(failed_reviews)} notification(s) to Slack.\n\nFailed review IDs: {failed_reviews}\n\n⚠️ State NOT updated - these reviews will be retried on next run."
             send_error_notification(error_msg, "Slack Notification Failure")
-            # DON'T update state for failed reviews - let next run retry!
             print("\n⚠️ State NOT updated due to failures - will retry on next run")
         else:
-            # Only update state if ALL notifications succeeded
             try:
                 valid_ids = [r['review_id'] for r in reviews_data if isinstance(r, dict) and 'review_id' in r]
                 if valid_ids:
